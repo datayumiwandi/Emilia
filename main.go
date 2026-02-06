@@ -76,47 +76,34 @@ type Stats struct {
 
 // === FUNGSI UTAMA ===
 func main() {
-	if err := os.MkdirAll("Data", os.ModePerm); err != nil {
+	// Buat folder Data dengan permission yang aman
+	if err := os.MkdirAll("Data", 0750); err != nil { // ✅ 0750 bukan 0777
 		fmt.Printf("❌ Gagal membuat folder Data: %v\n", err)
 		return
 	}
 
 	fmt.Println("==========================================")
-	fmt.Println("   GOLANG SOCKET SCANNER (GITHUB READY)  ")
+	fmt.Println("   GOLANG SOCKET SCANNER (SECURE EDITION)")
 	fmt.Printf("   Debug Mode: %v\n", Debug)
 	fmt.Println("==========================================")
 
 	// 0. LOAD CONFIG (SECURE)
-	// Langkah ini membaca .env (lokal) atau Secrets (GitHub)
-	loadEnv() 
-	
-	// Ambil URL dari Environment Variable
-	envURLs := os.Getenv("WORKER_URLS")
-	if envURLs != "" {
-		parts := strings.Split(envURLs, ",")
-		for _, u := range parts {
-			if trimmed := strings.TrimSpace(u); trimmed != "" {
-				workerURLs = append(workerURLs, trimmed)
-			}
-		}
-	}
-
-	if len(workerURLs) == 0 {
-		fmt.Println("❌ CRITICAL ERROR: WORKER_URLS tidak ditemukan!")
-		fmt.Println("   - Lokal : Pastikan ada file .env berisi WORKER_URLS=url1,url2")
-		fmt.Println("   - GitHub: Pastikan 'Settings > Secrets' sudah diisi WORKER_URLS")
+	if !loadConfig() {
 		return
 	}
-	fmt.Printf("🔒 Security: %d Worker URLs berhasil dimuat.\n", len(workerURLs))
 
 	// 1. DAPATKAN IP ASLI
 	fmt.Print("🔍 Mendapatkan IP Asli... ")
-	realIP := getPublicIPDirect()
-	if realIP == "" {
-		fmt.Println("\n❌ Gagal mendapatkan IP Asli. Cek koneksi internet.")
-		return
+	realIP, err := getPublicIPDirect()
+	if err != nil {
+		fmt.Printf("\n⚠️  Warning: %v (lanjut dengan validasi IP asli saja)\n", err)
+		realIP = "" // Lanjut tanpa realIP validation
 	}
-	fmt.Printf("%s\n\n", realIP)
+	if realIP != "" {
+		fmt.Printf("%s\n\n", realIP)
+	} else {
+		fmt.Println("N/A (skip validation)\n")
+	}
 
 	// 2. BACA FILE INPUT
 	proxies, err := readInputFile(FileInput)
@@ -162,8 +149,8 @@ func main() {
 					if res.Data.City != "" {
 						locInfo = fmt.Sprintf("%s-%s", res.Data.Country, res.Data.City)
 					}
-					fmt.Printf("\n✅ LIVE: %s:%s | %s | %s",
-						res.Data.IP, res.Data.Port, locInfo, res.Data.Org)
+					fmt.Printf("\n✅ LIVE: %s:%s | %s | %s | %s",
+						res.Data.IP, res.Data.Port, locInfo, res.Data.Org, res.Data.Source)
 				}
 			}
 
@@ -189,57 +176,85 @@ func main() {
 }
 
 // === FUNGSI SECURITY & CONFIG ===
-
-// loadEnv membaca file .env secara manual (tanpa library godotenv)
-// Ini berguna agar kode jalan di laptop tanpa setup environment variable di OS
-func loadEnv() {
+func loadConfig() bool {
+	// Coba baca dari file .env lokal terlebih dahulu
 	file, err := os.Open(".env")
-	if err != nil {
-		// Jika file .env tidak ada, mungkin kita sedang di GitHub Actions
-		// Jadi kita abaikan error ini.
-		return 
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
+	if err == nil {
+		defer file.Close()
 		
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) == 2 {
-			key := strings.TrimSpace(parts[0])
-			value := strings.TrimSpace(parts[1])
-			// Hilangkan tanda kutip jika ada
-			value = strings.Trim(value, `"'`)
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
 			
-			// Set ke environment variable program ini
-			os.Setenv(key, value)
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				key := strings.TrimSpace(parts[0])
+				value := strings.TrimSpace(parts[1])
+				value = strings.Trim(value, `"'`)
+				os.Setenv(key, value)
+			}
 		}
 	}
+
+	// Ambil URL dari Environment Variable
+	envURLs := os.Getenv("WORKER_URLS")
+	if envURLs == "" {
+		fmt.Println("❌ ERROR: WORKER_URLS tidak ditemukan!")
+		fmt.Println("\n📝 Cara setup:")
+		fmt.Println("   1. Lokal: Buat file .env dengan isi:")
+		fmt.Println("      WORKER_URLS=https://url1.com,https://url2.com")
+		fmt.Println("   2. GitHub: Tambah di Settings > Secrets > Actions")
+		fmt.Println("      dengan nama WORKER_URLS")
+		return false
+	}
+
+	// Parse URLs
+	parts := strings.Split(envURLs, ",")
+	for _, u := range parts {
+		trimmed := strings.TrimSpace(u)
+		if trimmed != "" && isValidURL(trimmed) {
+			workerURLs = append(workerURLs, trimmed)
+		}
+	}
+
+	if len(workerURLs) == 0 {
+		fmt.Println("❌ Tidak ada worker URL yang valid!")
+		return false
+	}
+
+	fmt.Printf("🔒 Security: %d Worker URLs berhasil dimuat.\n", len(workerURLs))
+	return true
+}
+
+func isValidURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
 }
 
 // === FUNGSI BANTU UTAMA ===
 func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
-	
 	// LAYER 1: Worker (JSON Response)
 	for i, target := range workerURLs {
 		body, code := rawSocketRequest(target, input.IP, input.Port)
 		if code == 200 {
 			var resp WorkerResponse
 			if err := json.Unmarshal(body, &resp); err == nil {
-				if isValidIP(resp.IP) && resp.IP != realIP {
-					
+				// Validasi IP dengan lebih ketat
+				if isValidIP(resp.IP) && (realIP == "" || resp.IP != realIP) {
 					finalOrg := cleanOrgName(input.OrgInput)
 					if resp.Org != "" {
 						finalOrg = cleanOrgName(resp.Org)
 					}
 
-					finalCountry := strings.ToUpper(input.Country)
+					finalCountry := normalizeCountry(input.Country)
 					if resp.Country != "" {
-						finalCountry = strings.ToUpper(resp.Country)
+						finalCountry = normalizeCountry(resp.Country)
 					}
 
 					return CheckResult{
@@ -258,16 +273,15 @@ func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
 		}
 	}
 
-	// LAYER 2: Cloudflare Trace (Text Response with loc=)
+	// LAYER 2: Cloudflare Trace
 	body, code := rawSocketRequest(TraceURL, input.IP, input.Port)
 	if code == 200 {
 		ip, loc := parseTraceDetails(string(body))
 		
-		if isValidIP(ip) && ip != realIP {
-			
-			finalCountry := strings.ToUpper(input.Country)
+		if isValidIP(ip) && (realIP == "" || ip != realIP) {
+			finalCountry := normalizeCountry(input.Country)
 			if loc != "" {
-				finalCountry = strings.ToUpper(loc)
+				finalCountry = normalizeCountry(loc)
 			}
 
 			return CheckResult{
@@ -275,26 +289,26 @@ func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
 				Data: &ValidProxy{
 					IP:      input.IP,
 					Port:    input.Port,
-					Country: finalCountry, 
-					Org:     cleanOrgName(input.OrgInput), 
+					Country: finalCountry,
+					Org:     cleanOrgName(input.OrgInput),
 					Source:  "CF Trace",
 				},
 			}
 		}
 	}
 	
-	// LAYER 3: AWS CheckIP (Plain IP only)
+	// LAYER 3: AWS CheckIP
 	body, code = rawSocketRequest(AwsURL, input.IP, input.Port)
 	if code == 200 {
 		ip := strings.TrimSpace(string(body))
-		if isValidIP(ip) && ip != realIP {
+		if isValidIP(ip) && (realIP == "" || ip != realIP) {
 			return CheckResult{
 				Valid: true,
 				Data: &ValidProxy{
 					IP:      input.IP,
 					Port:    input.Port,
-					Country: strings.ToUpper(input.Country), // Fallback Input
-					Org:     cleanOrgName(input.OrgInput),   // Fallback Input
+					Country: normalizeCountry(input.Country),
+					Org:     cleanOrgName(input.OrgInput),
 					Source:  "AWS",
 				},
 			}
@@ -302,6 +316,15 @@ func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
 	}
 
 	return CheckResult{Valid: false}
+}
+
+func normalizeCountry(country string) string {
+	country = strings.ToUpper(strings.TrimSpace(country))
+	// Jika lebih dari 2 karakter, ambil 2 karakter pertama
+	if len(country) > 2 {
+		return country[:2]
+	}
+	return country
 }
 
 func rawSocketRequest(targetURL, proxyIP, proxyPort string) ([]byte, int) {
@@ -329,11 +352,7 @@ func rawSocketRequest(targetURL, proxyIP, proxyPort string) ([]byte, int) {
 	if err != nil {
 		return nil, 0
 	}
-	defer func() {
-		if conn != nil {
-			conn.Close()
-		}
-	}()
+	defer conn.Close()
 
 	tlsConfig := &tls.Config{
 		ServerName:         host,
@@ -384,7 +403,7 @@ func rawSocketRequest(targetURL, proxyIP, proxyPort string) ([]byte, int) {
 }
 
 // === FUNGSI UTILITAS ===
-func getPublicIPDirect() string {
+func getPublicIPDirect() (string, error) {
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
@@ -397,30 +416,31 @@ func getPublicIPDirect() string {
 	for _, u := range workerURLs {
 		resp, err := client.Get(u)
 		if err == nil && resp.StatusCode == 200 {
-			defer resp.Body.Close()
 			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			if err == nil {
 				var w WorkerResponse
 				if json.Unmarshal(body, &w) == nil && isValidIP(w.IP) {
-					return w.IP
+					return w.IP, nil
 				}
 			}
 		}
 	}
 
+	// Fallback ke AWS
 	resp, err := client.Get(AwsURL)
 	if err == nil && resp.StatusCode == 200 {
-		defer resp.Body.Close()
 		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err == nil {
 			ip := strings.TrimSpace(string(body))
 			if isValidIP(ip) {
-				return ip
+				return ip, nil
 			}
 		}
 	}
 
-	return ""
+	return "", fmt.Errorf("tidak bisa mendapatkan IP publik")
 }
 
 func parseTraceDetails(text string) (string, string) {
@@ -448,13 +468,14 @@ func cleanOrgName(org string) string {
 func readInputFile(path string) ([]ProxyInput, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gagal membuka file: %v", err)
 	}
 	defer file.Close()
 
 	var proxies []ProxyInput
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
+	
 	for scanner.Scan() {
 		lineNum++
 		line := scanner.Text()
@@ -469,7 +490,7 @@ func readInputFile(path string) ([]ProxyInput, error) {
 			country := strings.TrimSpace(parts[2])
 			org := strings.TrimSpace(parts[3])
 
-			if ip != "" && port != "" {
+			if ip != "" && port != "" && isValidIP(ip) {
 				proxies = append(proxies, ProxyInput{
 					IP:       ip,
 					Port:     port,
@@ -479,7 +500,16 @@ func readInputFile(path string) ([]ProxyInput, error) {
 			}
 		}
 	}
-	return proxies, scanner.Err()
+	
+	if err := scanner.Err(); err != nil {
+		return proxies, fmt.Errorf("error membaca file line %d: %v", lineNum, err)
+	}
+	
+	if len(proxies) == 0 {
+		return proxies, fmt.Errorf("tidak ada proxy valid dalam file")
+	}
+	
+	return proxies, nil
 }
 
 func isValidIP(ip string) bool {
@@ -528,19 +558,10 @@ func saveResults(proxies []ValidProxy) {
 		return proxies[i].Country < proxies[j].Country
 	})
 
-	fAlive, err := os.Create(FileAlive)
-	if err != nil {
-		fmt.Printf("❌ Gagal membuat file %s: %v\n", FileAlive, err)
+	if err := writeToFile(FileAlive, proxies); err != nil {
+		fmt.Printf("❌ Gagal menyimpan %s: %v\n", FileAlive, err)
 		return
 	}
-	defer fAlive.Close()
-
-	wAlive := bufio.NewWriter(fAlive)
-	for _, p := range proxies {
-		line := fmt.Sprintf("%s,%s,%s,%s\n", p.IP, p.Port, p.Country, p.Org)
-		wAlive.WriteString(line)
-	}
-	wAlive.Flush()
 
 	// 2. SAVE PRIORITY
 	prioList := make([]ValidProxy, len(proxies))
@@ -578,19 +599,10 @@ func saveResults(proxies []ValidProxy) {
 		return c1 < c2
 	})
 
-	fPrio, err := os.Create(FilePriority)
-	if err != nil {
-		fmt.Printf("❌ Gagal membuat file %s: %v\n", FilePriority, err)
+	if err := writeToFile(FilePriority, prioList); err != nil {
+		fmt.Printf("❌ Gagal menyimpan %s: %v\n", FilePriority, err)
 		return
 	}
-	defer fPrio.Close()
-
-	wPrio := bufio.NewWriter(fPrio)
-	for _, p := range prioList {
-		line := fmt.Sprintf("%s,%s,%s,%s\n", p.IP, p.Port, p.Country, p.Org)
-		wPrio.WriteString(line)
-	}
-	wPrio.Flush()
 
 	// 3. REPORT
 	countryCount := make(map[string]int)
@@ -610,4 +622,21 @@ func saveResults(proxies []ValidProxy) {
 			fmt.Printf("   - %s: 0 proxies\n", code)
 		}
 	}
+}
+
+func writeToFile(filename string, proxies []ValidProxy) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	for _, p := range proxies {
+		line := fmt.Sprintf("%s,%s,%s,%s\n", p.IP, p.Port, p.Country, p.Org)
+		if _, err := writer.WriteString(line); err != nil {
+			return err
+		}
+	}
+	return writer.Flush()
 }
