@@ -3,11 +3,9 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
-	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,27 +16,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	// Import package useragent kamu
 	"emilia/useragent"
 )
 
 // === KONFIGURASI ===
 const (
-	Debug         = false // Set true jika ingin melihat log detail per IP
-	TimeoutSec    = 4     // Timeout per socket connection
-	MaxConcurrent = 240   // Sesuaikan dengan batas Open Files (ulimit) OS kamu
+	Debug         = false
+	TimeoutSec    = 5
+	MaxConcurrent = 200
 )
-
-// Jenis cara akses proxy
-const (
-	ProxyKindHTTPConnect = "http_connect" // HTTP/HTTPS proxy (CONNECT method)
-	ProxyKindDirectTLS   = "direct_tls"   // Server TLS langsung (SNI/Reverse Proxy)
-)
-
-// === PILIH MODE ===
-// Gunakan ProxyKindHTTPConnect untuk list proxy umum
-const ProxyMode = ProxyKindHTTPConnect
 
 var workerURLs = []string{
 	"https://api-check4.checkv4.workers.dev",
@@ -50,7 +36,7 @@ var workerURLs = []string{
 const (
 	TraceURL     = "https://1.1.1.1/cdn-cgi/trace"
 	AwsURL       = "https://checkip.amazonaws.com"
-	FileInput    = "Data/IPProxy45Kbaru.txt"
+	FileInput    = "Data/IPPROXY23K.txt"
 	FileAlive    = "Data/alive.txt"
 	FilePriority = "Data/Country-ALIVE.txt"
 )
@@ -91,12 +77,14 @@ type Stats struct {
 
 // === FUNGSI UTAMA ===
 func main() {
-	// Setup direktori data
-	_ = os.MkdirAll("Data", os.ModePerm)
+	if err := os.MkdirAll("Data", os.ModePerm); err != nil {
+		fmt.Printf("❌ Gagal membuat folder Data: %v\n", err)
+		return
+	}
 
 	fmt.Println("==========================================")
-	fmt.Println("   GOLANG SOCKET SCANNER (FINAL FIX)    ")
-	fmt.Printf("   Mode: %s | Debug: %v\n", ProxyMode, Debug)
+	fmt.Println("   GOLANG SOCKET SCANNER (SORTING PRO)  ")
+	fmt.Printf("   Debug Mode: %v\n", Debug)
 	fmt.Println("==========================================")
 
 	// 1. DAPATKAN IP ASLI
@@ -111,32 +99,36 @@ func main() {
 	// 2. BACA FILE INPUT
 	proxies, err := readInputFile(FileInput)
 	if err != nil {
-		fmt.Printf("❌ Error membaca file '%s': %v\n", FileInput, err)
+		fmt.Printf("❌ Error membaca file: %v\n", err)
 		return
 	}
 	fmt.Printf("📂 Total Proxy Loaded: %d\n", len(proxies))
-	fmt.Println("🚀 Memulai scan socket parallel...\n")
+	if len(proxies) == 0 {
+		fmt.Println("❌ Tidak ada proxy untuk di-scan.")
+		return
+	}
+	fmt.Println("🚀 Memulai scan socket parallel, Mohon tunggu.\n")
 
 	// 3. SCANNING
 	stats := &Stats{Total: int32(len(proxies))}
 	resultsChan := make(chan CheckResult, len(proxies))
 
 	var wg sync.WaitGroup
-	// Semaphore pattern untuk membatasi concurrency
 	sem := make(chan struct{}, MaxConcurrent)
 
-	// Progress Monitor (Ticker)
-	ticker := time.NewTicker(2 * time.Second)
+	// Progress monitor
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
 	done := make(chan bool)
 	go progressMonitor(ticker, done, stats)
 
 	for _, p := range proxies {
 		wg.Add(1)
-		sem <- struct{}{} // Ambil token antrian
+		sem <- struct{}{}
 
 		go func(proxy ProxyInput) {
 			defer wg.Done()
-			defer func() { <-sem }() // Lepas token antrian
+			defer func() { <-sem }()
 
 			res := checkProxyManualSocket(proxy, realIP)
 			atomic.AddInt32(&stats.Checked, 1)
@@ -144,7 +136,8 @@ func main() {
 			if res.Valid {
 				atomic.AddInt32(&stats.Live, 1)
 				if Debug {
-					fmt.Printf("\n✅ LIVE: %s:%s | %s\n", res.Data.IP, res.Data.Port, res.Data.Org)
+					fmt.Printf("\n✅ LIVE: %s:%s | Org: %s",
+						res.Data.IP, res.Data.Port, res.Data.Org)
 				}
 			}
 
@@ -153,50 +146,52 @@ func main() {
 	}
 
 	wg.Wait()
-	
-	// Bersihkan Ticker agar tidak leak
-	ticker.Stop()
-	done <- true
-	
+	close(done)
 	close(resultsChan)
 
 	// 4. SORTING & SAVING
-	fmt.Println("\n\n🏁 Scanning selesai. Menyimpan hasil...")
-	saveValidResults(resultsChan)
+	fmt.Println("\n\n🏁 Scanning selesai. Menyimpan hasil.")
+
+	var validProxies []ValidProxy
+	for res := range resultsChan {
+		if res.Valid && res.Data != nil {
+			validProxies = append(validProxies, *res.Data)
+		}
+	}
+
+	saveResults(validProxies)
 }
 
-// === LOGIKA PENGECEKAN (CORE) ===
+// === FUNGSI BANTU UTAMA ===
 func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
-	// Layer 1: Worker URLs (Load Balanced)
-	// Pilih 1 worker acak agar tidak membebani server worker pertama terus menerus
-	randomWorker := workerURLs[rand.Intn(len(workerURLs))]
-	
-	body, code := rawSocketRequest(randomWorker, input.IP, input.Port)
-	if code == 200 {
-		var resp WorkerResponse
-		if err := json.Unmarshal(body, &resp); err == nil {
-			if isValidIP(resp.IP) && resp.IP != realIP {
-				finalOrg := input.OrgInput
-				// Gunakan org dari worker jika tersedia, karena biasanya lebih akurat
-				if resp.Org != "" {
-					finalOrg = cleanOrgName(resp.Org)
-				}
-				return CheckResult{
-					Valid: true,
-					Data: &ValidProxy{
-						IP:      input.IP,
-						Port:    input.Port,
-						Country: input.Country,
-						Org:     finalOrg,
-						Source:  "Worker",
-					},
+	// Layer 1: Worker URLs
+	for i, target := range workerURLs {
+		body, code := rawSocketRequest(target, input.IP, input.Port)
+		if code == 200 {
+			var resp WorkerResponse
+			if err := json.Unmarshal(body, &resp); err == nil {
+				if isValidIP(resp.IP) && resp.IP != realIP {
+					finalOrg := input.OrgInput
+					if resp.Org != "" {
+						finalOrg = cleanOrgName(resp.Org)
+					}
+					return CheckResult{
+						Valid: true,
+						Data: &ValidProxy{
+							IP:      input.IP,
+							Port:    input.Port,
+							Country: input.Country,
+							Org:     finalOrg,
+							Source:  fmt.Sprintf("Worker-%d", i+1),
+						},
+					}
 				}
 			}
 		}
 	}
 
-	// Layer 2: Cloudflare Trace (Fallback)
-	body, code = rawSocketRequest(TraceURL, input.IP, input.Port)
+	// Layer 2: Cloudflare Trace
+	body, code := rawSocketRequest(TraceURL, input.IP, input.Port)
 	if code == 200 {
 		ip := parseTraceIP(string(body))
 		if isValidIP(ip) && ip != realIP {
@@ -213,7 +208,7 @@ func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
 		}
 	}
 
-	// Layer 3: AWS CheckIP (Last Resort)
+	// Layer 3: AWS CheckIP
 	body, code = rawSocketRequest(AwsURL, input.IP, input.Port)
 	if code == 200 {
 		ip := strings.TrimSpace(string(body))
@@ -234,147 +229,123 @@ func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
 	return CheckResult{Valid: false}
 }
 
-// Dispatcher: Memilih fungsi request berdasarkan mode
 func rawSocketRequest(targetURL, proxyIP, proxyPort string) ([]byte, int) {
-	switch ProxyMode {
-	case ProxyKindHTTPConnect:
-		return rawSocketRequestHTTPProxy(targetURL, proxyIP, proxyPort)
-	case ProxyKindDirectTLS:
-		return rawSocketRequestDirectTLS(targetURL, proxyIP, proxyPort)
-	default:
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
 		return nil, 0
 	}
-}
 
-// === IMPLEMENTASI RAW SOCKET ===
-
-func rawSocketRequestHTTPProxy(targetURL, proxyIP, proxyPort string) ([]byte, int) {
-	parsedURL, _ := url.Parse(targetURL)
 	host := parsedURL.Hostname()
-	port := parsedURL.Port()
-	if port == "" {
-		if parsedURL.Scheme == "https" { port = "443" } else { port = "80" }
-	}
-	path := parsedURL.RequestURI()
-	if path == "" { path = "/" }
-
-	// 1. TCP ke Proxy
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(proxyIP, proxyPort), time.Duration(TimeoutSec)*time.Second)
-	if err != nil { return nil, 0 }
-	defer conn.Close() // Pastikan koneksi ditutup di akhir fungsi
-
-	// Set Deadline Global untuk koneksi ini
-	conn.SetDeadline(time.Now().Add(time.Duration(TimeoutSec) * time.Second))
-
-	// HTTPS via CONNECT (Tunneling)
-	if parsedURL.Scheme == "https" {
-		connectReq := fmt.Sprintf("CONNECT %s:%s HTTP/1.1\r\nHost: %s:%s\r\n\r\n", host, port, host, port)
-		if _, err := conn.Write([]byte(connectReq)); err != nil { return nil, 0 }
-
-		br := bufio.NewReader(conn)
-		resp, err := http.ReadResponse(br, nil)
-		if err != nil { return nil, 0 }
-		
-		// PENTING: Kuras body response CONNECT agar buffer bersih
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 { return nil, resp.StatusCode }
-
-		// Handshake TLS di atas koneksi TCP yang sudah ada
-		tlsConn := tls.Client(conn, &tls.Config{ServerName: host, InsecureSkipVerify: true})
-		if err := tlsConn.Handshake(); err != nil { return nil, 0 }
-		
-		// Reset deadline untuk request selanjutnya
-		tlsConn.SetDeadline(time.Now().Add(time.Duration(TimeoutSec) * time.Second))
-
-		// Kirim GET Request terenkripsi
-		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nConnection: close\r\n\r\n", 
-			path, host, useragent.GetRandom())
-		
-		if _, err := tlsConn.Write([]byte(req)); err != nil { return nil, 0 }
-
-		reader := bufio.NewReader(tlsConn)
-		httpResp, err := http.ReadResponse(reader, nil)
-		if err != nil { return nil, 0 }
-		defer httpResp.Body.Close()
-
-		body, err := io.ReadAll(httpResp.Body)
-		if err != nil { return nil, httpResp.StatusCode }
-		return body, httpResp.StatusCode
+	if host == "" {
+		return nil, 0
 	}
 
-	// HTTP Plain Proxy (Tanpa CONNECT)
-	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nConnection: close\r\n\r\n", 
-		parsedURL.String(), parsedURL.Host, useragent.GetRandom())
-
-	if _, err := conn.Write([]byte(req)); err != nil { return nil, 0 }
-
-	reader := bufio.NewReader(conn)
-	httpResp, err := http.ReadResponse(reader, nil)
-	if err != nil { return nil, 0 }
-	defer httpResp.Body.Close()
-
-	body, err := io.ReadAll(httpResp.Body)
-	if err != nil { return nil, httpResp.StatusCode }
-	return body, httpResp.StatusCode
-}
-
-func rawSocketRequestDirectTLS(targetURL, proxyIP, proxyPort string) ([]byte, int) {
-	parsedURL, _ := url.Parse(targetURL)
-	host := parsedURL.Hostname()
 	path := parsedURL.Path
-	if path == "" { path = "/" }
+	if path == "" {
+		path = "/"
+	}
 
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(proxyIP, proxyPort), time.Duration(TimeoutSec)*time.Second)
-	if err != nil { return nil, 0 }
-	defer conn.Close()
+	// Validasi port
+	if proxyPort == "" {
+		return nil, 0
+	}
 
-	// Langsung TLS Handshake ke IP Proxy
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: host, InsecureSkipVerify: true})
-	if err := tlsConn.Handshake(); err != nil { return nil, 0 }
-	
-	tlsConn.SetDeadline(time.Now().Add(time.Duration(TimeoutSec) * time.Second))
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(proxyIP, proxyPort),
+		time.Duration(TimeoutSec)*time.Second)
+	if err != nil {
+		return nil, 0
+	}
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
 
-	rawRequest := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nConnection: close\r\n\r\n", 
-		path, host, useragent.GetRandom())
+	tlsConfig := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12, // TLS minimal 1.2 untuk keamanan
+	}
 
-	if _, err := tlsConn.Write([]byte(rawRequest)); err != nil { return nil, 0 }
+	tlsConn := tls.Client(conn, tlsConfig)
+	if tlsConn == nil {
+		return nil, 0
+	}
+
+	deadline := time.Now().Add(time.Duration(TimeoutSec) * time.Second)
+	tlsConn.SetDeadline(deadline)
+
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, 0
+	}
+	defer tlsConn.Close()
+
+	rawRequest := fmt.Sprintf(
+		"GET %s HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"User-Agent: %s\r\n"+
+			"Accept: */*\r\n"+
+			"Connection: close\r\n"+
+			"\r\n",
+		path, host, useragent.GetRandom(),
+	)
+
+	if _, err := tlsConn.Write([]byte(rawRequest)); err != nil {
+		return nil, 0
+	}
 
 	reader := bufio.NewReader(tlsConn)
 	resp, err := http.ReadResponse(reader, nil)
-	if err != nil { return nil, 0 }
+	if err != nil {
+		return nil, 0
+	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
-	if err != nil { return nil, resp.StatusCode }
+	if err != nil {
+		return nil, resp.StatusCode
+	}
+
 	return body, resp.StatusCode
 }
 
-// === UTILITIES ===
-
+// === FUNGSI UTILITAS ===
 func getPublicIPDirect() string {
-	client := &http.Client{Timeout: 10 * time.Second}
-	
-	// Coba akses ke salah satu worker secara acak
-	randURL := workerURLs[rand.Intn(len(workerURLs))]
-	resp, err := client.Get(randURL)
-	if err == nil {
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
-		var w WorkerResponse
-		if json.Unmarshal(body, &w) == nil && isValidIP(w.IP) {
-			return w.IP
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+	}
+
+	for _, u := range workerURLs {
+		resp, err := client.Get(u)
+		if err == nil && resp.StatusCode == 200 {
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err == nil {
+				var w WorkerResponse
+				if json.Unmarshal(body, &w) == nil && isValidIP(w.IP) {
+					return w.IP
+				}
+			}
 		}
 	}
-	
-	// Fallback ke AWS jika worker gagal
-	resp, err = client.Get(AwsURL)
-	if err != nil { return "" }
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	ip := strings.TrimSpace(string(body))
-	if isValidIP(ip) { return ip }
+
+	resp, err := client.Get(AwsURL)
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err == nil {
+			ip := strings.TrimSpace(string(body))
+			if isValidIP(ip) {
+				return ip
+			}
+		}
+	}
+
 	return ""
 }
 
@@ -390,114 +361,195 @@ func parseTraceIP(text string) string {
 }
 
 func cleanOrgName(org string) string {
+	if org == "" {
+		return ""
+	}
 	cleaned := regexOrg.ReplaceAllString(org, "")
 	return strings.TrimSpace(cleaned)
 }
 
-// readInputFile menggunakan CSV Reader agar robust terhadap koma di dalam nama Org
 func readInputFile(path string) ([]ProxyInput, error) {
 	file, err := os.Open(path)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer file.Close()
 
 	var proxies []ProxyInput
-	reader := csv.NewReader(file)
-	reader.FieldsPerRecord = -1 // Mengizinkan jumlah kolom yang bervariasi
-
-	rawLines, err := reader.ReadAll()
-	if err != nil { return nil, err }
-
-	for _, parts := range rawLines {
-		if len(parts) >= 2 { // Minimal IP dan Port
-			p := ProxyInput{
-				IP:   strings.TrimSpace(parts[0]),
-				Port: strings.TrimSpace(parts[1]),
-			}
-			if len(parts) > 2 { p.Country = strings.TrimSpace(parts[2]) }
-			if len(parts) > 3 { p.OrgInput = strings.TrimSpace(parts[3]) }
-			proxies = append(proxies, p)
+	scanner := bufio.NewScanner(file)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
 		}
+
+		parts := strings.Split(line, ",")
+		if len(parts) >= 4 {
+			ip := strings.TrimSpace(parts[0])
+			port := strings.TrimSpace(parts[1])
+			country := strings.TrimSpace(parts[2])
+			org := strings.TrimSpace(parts[3])
+
+			if ip != "" && port != "" && country != "" {
+				proxies = append(proxies, ProxyInput{
+					IP:       ip,
+					Port:     port,
+					Country:  country,
+					OrgInput: org,
+				})
+			} else if Debug {
+				fmt.Printf("⚠️  Baris %d diabaikan: format tidak lengkap\n", lineNum)
+			}
+		} else if Debug {
+			fmt.Printf("⚠️  Baris %d diabaikan: hanya %d bagian\n", lineNum, len(parts))
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return proxies, fmt.Errorf("error membaca file: %v", err)
 	}
 	return proxies, nil
 }
 
 func isValidIP(ip string) bool {
-	return ip != "" && net.ParseIP(ip) != nil
+	if ip == "" {
+		return false
+	}
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return false
+	}
+	// Tolok IP pribadi dan loopback
+	if parsedIP.IsPrivate() || parsedIP.IsLoopback() || parsedIP.IsUnspecified() {
+		return false
+	}
+	return true
 }
 
 func progressMonitor(ticker *time.Ticker, done chan bool, stats *Stats) {
 	for {
 		select {
 		case <-done:
+			fmt.Printf("\r⏳ Progress: %d/%d | ✅ Live: %d   \n",
+				atomic.LoadInt32(&stats.Checked),
+				stats.Total,
+				atomic.LoadInt32(&stats.Live))
 			return
 		case <-ticker.C:
 			current := atomic.LoadInt32(&stats.Checked)
 			live := atomic.LoadInt32(&stats.Live)
-			fmt.Printf("\r⏳ Progress: %d/%d | ✅ Live: %d   ", current, stats.Total, live)
+			fmt.Printf("\r⏳ Progress: %d/%d | ✅ Live: %d   ",
+				current, stats.Total, live)
 		}
 	}
 }
 
-func saveValidResults(resultsChan chan CheckResult) {
-	var validProxies []ValidProxy
-	for res := range resultsChan {
-		if res.Valid && res.Data != nil {
-			validProxies = append(validProxies, *res.Data)
-		}
-	}
-
-	if len(validProxies) == 0 {
-		fmt.Println("⚠️ Tidak ada proxy yang valid.")
+func saveResults(proxies []ValidProxy) {
+	if len(proxies) == 0 {
+		fmt.Println("❌ Tidak ada proxy yang valid untuk disimpan.")
 		return
 	}
 
-	// 1. Urutkan A-Z berdasarkan negara
-	sort.Slice(validProxies, func(i, j int) bool {
-		return validProxies[i].Country < validProxies[j].Country
+	// 1. SAVE ALIVE (sorted A-Z by country)
+	sort.Slice(proxies, func(i, j int) bool {
+		if proxies[i].Country == proxies[j].Country {
+			return proxies[i].IP < proxies[j].IP
+		}
+		return proxies[i].Country < proxies[j].Country
 	})
-	if err := writeProxyFile(FileAlive, validProxies); err != nil {
-		fmt.Printf("❌ Gagal menyimpan %s: %v\n", FileAlive, err)
+
+	fAlive, err := os.Create(FileAlive)
+	if err != nil {
+		fmt.Printf("❌ Gagal membuat file %s: %v\n", FileAlive, err)
+		return
 	}
+	defer fAlive.Close()
 
-	// 2. Urutkan berdasarkan Prioritas (ID -> MY -> SG -> HK)
-	prioList := make([]ValidProxy, len(validProxies))
-	copy(prioList, validProxies)
-	priorityOrder := map[string]int{"ID": 1, "MY": 2, "SG": 3, "HK": 4}
-
-	sort.SliceStable(prioList, func(i, j int) bool {
-		c1, c2 := prioList[i].Country, prioList[j].Country
-		p1, ok1 := priorityOrder[c1]
-		p2, ok2 := priorityOrder[c2]
-		
-		if ok1 && ok2 { return p1 < p2 }
-		if ok1 { return true }
-		if ok2 { return false }
-		return c1 < c2
-	})
-	if err := writeProxyFile(FilePriority, prioList); err != nil {
-		fmt.Printf("❌ Gagal menyimpan %s: %v\n", FilePriority, err)
-	}
-
-	// Report Akhir
-	fmt.Printf("\n\n📁 Report Output:\n")
-	fmt.Printf("   ✓ %s (Total: %d)\n", FileAlive, len(validProxies))
-	fmt.Printf("   ✓ %s (Sorted Priority)\n", FilePriority)
-}
-
-func writeProxyFile(filename string, proxies []ValidProxy) error {
-	f, err := os.Create(filename)
-	if err != nil { return err }
-	defer f.Close()
-
-	w := bufio.NewWriter(f)
-	defer w.Flush()
-
+	wAlive := bufio.NewWriter(fAlive)
 	for _, p := range proxies {
-		// Format output: IP,Port,Country,Org
-		// Cek error saat penulisan baris
-		if _, err := w.WriteString(fmt.Sprintf("%s,%s,%s,%s\n", p.IP, p.Port, p.Country, p.Org)); err != nil {
-			return err
+		line := fmt.Sprintf("%s,%s,%s,%s\n", p.IP, p.Port, p.Country, p.Org)
+		if _, err := wAlive.WriteString(line); err != nil {
+			fmt.Printf("⚠️  Gagal menulis ke %s: %v\n", FileAlive, err)
+			break
 		}
 	}
-	return nil
+	if err := wAlive.Flush(); err != nil {
+		fmt.Printf("⚠️  Gagal flush %s: %v\n", FileAlive, err)
+	}
+
+	// 2. SAVE PRIORITY (special sorting)
+	prioList := make([]ValidProxy, len(proxies))
+	copy(prioList, proxies)
+
+	priorityOrder := map[string]int{
+		"ID": 1,
+		"MY": 2,
+		"SG": 3,
+		"HK": 4,
+	}
+
+	sort.SliceStable(prioList, func(i, j int) bool {
+		c1 := prioList[i].Country
+		c2 := prioList[j].Country
+
+		prio1, hasPrio1 := priorityOrder[c1]
+		prio2, hasPrio2 := priorityOrder[c2]
+
+		if hasPrio1 && hasPrio2 {
+			if prio1 == prio2 {
+				return prioList[i].IP < prioList[j].IP
+			}
+			return prio1 < prio2
+		}
+		if hasPrio1 {
+			return true
+		}
+		if hasPrio2 {
+			return false
+		}
+		if c1 == c2 {
+			return prioList[i].IP < prioList[j].IP
+		}
+		return c1 < c2
+	})
+
+	fPrio, err := os.Create(FilePriority)
+	if err != nil {
+		fmt.Printf("❌ Gagal membuat file %s: %v\n", FilePriority, err)
+		return
+	}
+	defer fPrio.Close()
+
+	wPrio := bufio.NewWriter(fPrio)
+	for _, p := range prioList {
+		line := fmt.Sprintf("%s,%s,%s,%s\n", p.IP, p.Port, p.Country, p.Org)
+		if _, err := wPrio.WriteString(line); err != nil {
+			fmt.Printf("⚠️  Gagal menulis ke %s: %v\n", FilePriority, err)
+			break
+		}
+	}
+	if err := wPrio.Flush(); err != nil {
+		fmt.Printf("⚠️  Gagal flush %s: %v\n", FilePriority, err)
+	}
+
+	// 3. REPORT
+	countryCount := make(map[string]int)
+	for _, p := range prioList {
+		countryCount[p.Country]++
+	}
+
+	fmt.Printf("\n\n📁 Output Report:\n")
+	fmt.Printf("   ✓ Alive.txt    : %d proxies (Urut A-Z)\n", len(proxies))
+	fmt.Printf("   ✓ Priority.txt : %d proxies (ID → MY → SG → HK → A-Z)\n", len(prioList))
+
+	fmt.Println("\n📊 Jumlah per negara prioritas:")
+	for _, code := range []string{"ID", "MY", "SG", "HK"} {
+		if count, ok := countryCount[code]; ok {
+			fmt.Printf("   - %s: %d proxies\n", code, count)
+		} else {
+			fmt.Printf("   - %s: 0 proxies\n", code)
+		}
+	}
 }
