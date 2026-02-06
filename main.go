@@ -45,8 +45,10 @@ var regexOrg = regexp.MustCompile(`[^a-zA-Z0-9\s]`)
 
 // === STRUKTUR DATA ===
 type WorkerResponse struct {
-	IP  string `json:"ip"`
-	Org string `json:"as_organization"`
+	IP      string `json:"ip"`
+	Org     string `json:"as_organization"`
+	Country string `json:"country"`
+	City    string `json:"city"`
 }
 
 type ProxyInput struct {
@@ -61,6 +63,7 @@ type ValidProxy struct {
 	Port    string
 	Country string
 	Org     string
+	City    string
 	Source  string
 }
 
@@ -136,8 +139,12 @@ func main() {
 			if res.Valid {
 				atomic.AddInt32(&stats.Live, 1)
 				if Debug {
-					fmt.Printf("\n✅ LIVE: %s:%s | Org: %s",
-						res.Data.IP, res.Data.Port, res.Data.Org)
+					locInfo := res.Data.Country
+					if res.Data.City != "" {
+						locInfo = fmt.Sprintf("%s-%s", res.Data.Country, res.Data.City)
+					}
+					fmt.Printf("\n✅ LIVE: %s:%s | %s | %s",
+						res.Data.IP, res.Data.Port, locInfo, res.Data.Org)
 				}
 			}
 
@@ -164,24 +171,32 @@ func main() {
 
 // === FUNGSI BANTU UTAMA ===
 func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
-	// Layer 1: Worker URLs
+	
 	for i, target := range workerURLs {
 		body, code := rawSocketRequest(target, input.IP, input.Port)
 		if code == 200 {
 			var resp WorkerResponse
 			if err := json.Unmarshal(body, &resp); err == nil {
 				if isValidIP(resp.IP) && resp.IP != realIP {
-					finalOrg := input.OrgInput
+					
+					finalOrg := cleanOrgName(input.OrgInput)
 					if resp.Org != "" {
 						finalOrg = cleanOrgName(resp.Org)
 					}
+
+					finalCountry := strings.ToUpper(input.Country)
+					if resp.Country != "" {
+						finalCountry = strings.ToUpper(resp.Country)
+					}
+
 					return CheckResult{
 						Valid: true,
 						Data: &ValidProxy{
 							IP:      input.IP,
 							Port:    input.Port,
-							Country: input.Country,
+							Country: finalCountry,
 							Org:     finalOrg,
+							City:    resp.City,
 							Source:  fmt.Sprintf("Worker-%d", i+1),
 						},
 					}
@@ -190,25 +205,33 @@ func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
 		}
 	}
 
-	// Layer 2: Cloudflare Trace
 	body, code := rawSocketRequest(TraceURL, input.IP, input.Port)
 	if code == 200 {
-		ip := parseTraceIP(string(body))
+		
+		ip, loc := parseTraceDetails(string(body))
+		
 		if isValidIP(ip) && ip != realIP {
+			
+			
+			finalCountry := strings.ToUpper(input.Country)
+			if loc != "" {
+				finalCountry = strings.ToUpper(loc)
+			}
+
 			return CheckResult{
 				Valid: true,
 				Data: &ValidProxy{
 					IP:      input.IP,
 					Port:    input.Port,
-					Country: input.Country,
-					Org:     cleanOrgName(input.OrgInput),
+					Country: finalCountry, 
+					Org:     cleanOrgName(input.OrgInput), // Trace tidak punya info Org/ISP
 					Source:  "CF Trace",
 				},
 			}
 		}
 	}
 
-	// Layer 3: AWS CheckIP
+	
 	body, code = rawSocketRequest(AwsURL, input.IP, input.Port)
 	if code == 200 {
 		ip := strings.TrimSpace(string(body))
@@ -218,8 +241,8 @@ func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
 				Data: &ValidProxy{
 					IP:      input.IP,
 					Port:    input.Port,
-					Country: input.Country,
-					Org:     cleanOrgName(input.OrgInput),
+					Country: strings.ToUpper(input.Country), // Pakai Input
+					Org:     cleanOrgName(input.OrgInput),   // Pakai Input
 					Source:  "AWS",
 				},
 			}
@@ -245,7 +268,6 @@ func rawSocketRequest(targetURL, proxyIP, proxyPort string) ([]byte, int) {
 		path = "/"
 	}
 
-	// Validasi port
 	if proxyPort == "" {
 		return nil, 0
 	}
@@ -264,7 +286,7 @@ func rawSocketRequest(targetURL, proxyIP, proxyPort string) ([]byte, int) {
 	tlsConfig := &tls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS12, // TLS minimal 1.2 untuk keamanan
+		MinVersion:         tls.VersionTLS12,
 	}
 
 	tlsConn := tls.Client(conn, tlsConfig)
@@ -349,15 +371,19 @@ func getPublicIPDirect() string {
 	return ""
 }
 
-func parseTraceIP(text string) string {
+// UPDATE: Mengembalikan IP dan Loc (Country)
+func parseTraceDetails(text string) (string, string) {
+	var ip, loc string
 	scanner := bufio.NewScanner(strings.NewReader(text))
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "ip=") {
-			return strings.TrimPrefix(line, "ip=")
+			ip = strings.TrimPrefix(line, "ip=")
+		} else if strings.HasPrefix(line, "loc=") {
+			loc = strings.TrimPrefix(line, "loc=")
 		}
 	}
-	return ""
+	return ip, loc
 }
 
 func cleanOrgName(org string) string {
@@ -392,25 +418,17 @@ func readInputFile(path string) ([]ProxyInput, error) {
 			country := strings.TrimSpace(parts[2])
 			org := strings.TrimSpace(parts[3])
 
-			if ip != "" && port != "" && country != "" {
+			if ip != "" && port != "" {
 				proxies = append(proxies, ProxyInput{
 					IP:       ip,
 					Port:     port,
 					Country:  country,
 					OrgInput: org,
 				})
-			} else if Debug {
-				fmt.Printf("⚠️  Baris %d diabaikan: format tidak lengkap\n", lineNum)
 			}
-		} else if Debug {
-			fmt.Printf("⚠️  Baris %d diabaikan: hanya %d bagian\n", lineNum, len(parts))
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		return proxies, fmt.Errorf("error membaca file: %v", err)
-	}
-	return proxies, nil
+	return proxies, scanner.Err()
 }
 
 func isValidIP(ip string) bool {
@@ -421,7 +439,6 @@ func isValidIP(ip string) bool {
 	if parsedIP == nil {
 		return false
 	}
-	// Tolok IP pribadi dan loopback
 	if parsedIP.IsPrivate() || parsedIP.IsLoopback() || parsedIP.IsUnspecified() {
 		return false
 	}
@@ -432,7 +449,7 @@ func progressMonitor(ticker *time.Ticker, done chan bool, stats *Stats) {
 	for {
 		select {
 		case <-done:
-			fmt.Printf("\r⏳ Progress: %d/%d | ✅ Live: %d   \n",
+			fmt.Printf("\r⏳ Progress: %d/%d | ✅ Live: %d    \n",
 				atomic.LoadInt32(&stats.Checked),
 				stats.Total,
 				atomic.LoadInt32(&stats.Live))
@@ -440,7 +457,7 @@ func progressMonitor(ticker *time.Ticker, done chan bool, stats *Stats) {
 		case <-ticker.C:
 			current := atomic.LoadInt32(&stats.Checked)
 			live := atomic.LoadInt32(&stats.Live)
-			fmt.Printf("\r⏳ Progress: %d/%d | ✅ Live: %d   ",
+			fmt.Printf("\r⏳ Progress: %d/%d | ✅ Live: %d    ",
 				current, stats.Total, live)
 		}
 	}
@@ -452,7 +469,7 @@ func saveResults(proxies []ValidProxy) {
 		return
 	}
 
-	// 1. SAVE ALIVE (sorted A-Z by country)
+	// 1. SAVE ALIVE
 	sort.Slice(proxies, func(i, j int) bool {
 		if proxies[i].Country == proxies[j].Country {
 			return proxies[i].IP < proxies[j].IP
@@ -470,16 +487,11 @@ func saveResults(proxies []ValidProxy) {
 	wAlive := bufio.NewWriter(fAlive)
 	for _, p := range proxies {
 		line := fmt.Sprintf("%s,%s,%s,%s\n", p.IP, p.Port, p.Country, p.Org)
-		if _, err := wAlive.WriteString(line); err != nil {
-			fmt.Printf("⚠️  Gagal menulis ke %s: %v\n", FileAlive, err)
-			break
-		}
+		wAlive.WriteString(line)
 	}
-	if err := wAlive.Flush(); err != nil {
-		fmt.Printf("⚠️  Gagal flush %s: %v\n", FileAlive, err)
-	}
+	wAlive.Flush()
 
-	// 2. SAVE PRIORITY (special sorting)
+	// 2. SAVE PRIORITY
 	prioList := make([]ValidProxy, len(proxies))
 	copy(prioList, proxies)
 
@@ -525,14 +537,9 @@ func saveResults(proxies []ValidProxy) {
 	wPrio := bufio.NewWriter(fPrio)
 	for _, p := range prioList {
 		line := fmt.Sprintf("%s,%s,%s,%s\n", p.IP, p.Port, p.Country, p.Org)
-		if _, err := wPrio.WriteString(line); err != nil {
-			fmt.Printf("⚠️  Gagal menulis ke %s: %v\n", FilePriority, err)
-			break
-		}
+		wPrio.WriteString(line)
 	}
-	if err := wPrio.Flush(); err != nil {
-		fmt.Printf("⚠️  Gagal flush %s: %v\n", FilePriority, err)
-	}
+	wPrio.Flush()
 
 	// 3. REPORT
 	countryCount := make(map[string]int)
