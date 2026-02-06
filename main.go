@@ -26,12 +26,8 @@ const (
 	MaxConcurrent = 200
 )
 
-var workerURLs = []string{
-	"https://api-check4.checkv4.workers.dev",
-	"https://api-check1.api-check1.workers.dev",
-	"https://api-check2.shirokoyumi.workers.dev",
-	"https://api-check3.sokove5110.workers.dev",
-}
+// Global variable, akan diisi otomatis dari Env/Secret
+var workerURLs []string
 
 const (
 	TraceURL     = "https://1.1.1.1/cdn-cgi/trace"
@@ -86,9 +82,32 @@ func main() {
 	}
 
 	fmt.Println("==========================================")
-	fmt.Println("   GOLANG SOCKET SCANNER (SORTING PRO)  ")
+	fmt.Println("   GOLANG SOCKET SCANNER (GITHUB READY)  ")
 	fmt.Printf("   Debug Mode: %v\n", Debug)
 	fmt.Println("==========================================")
+
+	// 0. LOAD CONFIG (SECURE)
+	// Langkah ini membaca .env (lokal) atau Secrets (GitHub)
+	loadEnv() 
+	
+	// Ambil URL dari Environment Variable
+	envURLs := os.Getenv("WORKER_URLS")
+	if envURLs != "" {
+		parts := strings.Split(envURLs, ",")
+		for _, u := range parts {
+			if trimmed := strings.TrimSpace(u); trimmed != "" {
+				workerURLs = append(workerURLs, trimmed)
+			}
+		}
+	}
+
+	if len(workerURLs) == 0 {
+		fmt.Println("❌ CRITICAL ERROR: WORKER_URLS tidak ditemukan!")
+		fmt.Println("   - Lokal : Pastikan ada file .env berisi WORKER_URLS=url1,url2")
+		fmt.Println("   - GitHub: Pastikan 'Settings > Secrets' sudah diisi WORKER_URLS")
+		return
+	}
+	fmt.Printf("🔒 Security: %d Worker URLs berhasil dimuat.\n", len(workerURLs))
 
 	// 1. DAPATKAN IP ASLI
 	fmt.Print("🔍 Mendapatkan IP Asli... ")
@@ -102,7 +121,7 @@ func main() {
 	// 2. BACA FILE INPUT
 	proxies, err := readInputFile(FileInput)
 	if err != nil {
-		fmt.Printf("❌ Error membaca file: %v\n", err)
+		fmt.Printf("❌ Error membaca file input: %v\n", err)
 		return
 	}
 	fmt.Printf("📂 Total Proxy Loaded: %d\n", len(proxies))
@@ -169,9 +188,43 @@ func main() {
 	saveResults(validProxies)
 }
 
+// === FUNGSI SECURITY & CONFIG ===
+
+// loadEnv membaca file .env secara manual (tanpa library godotenv)
+// Ini berguna agar kode jalan di laptop tanpa setup environment variable di OS
+func loadEnv() {
+	file, err := os.Open(".env")
+	if err != nil {
+		// Jika file .env tidak ada, mungkin kita sedang di GitHub Actions
+		// Jadi kita abaikan error ini.
+		return 
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			// Hilangkan tanda kutip jika ada
+			value = strings.Trim(value, `"'`)
+			
+			// Set ke environment variable program ini
+			os.Setenv(key, value)
+		}
+	}
+}
+
 // === FUNGSI BANTU UTAMA ===
 func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
 	
+	// LAYER 1: Worker (JSON Response)
 	for i, target := range workerURLs {
 		body, code := rawSocketRequest(target, input.IP, input.Port)
 		if code == 200 {
@@ -205,13 +258,12 @@ func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
 		}
 	}
 
+	// LAYER 2: Cloudflare Trace (Text Response with loc=)
 	body, code := rawSocketRequest(TraceURL, input.IP, input.Port)
 	if code == 200 {
-		
 		ip, loc := parseTraceDetails(string(body))
 		
 		if isValidIP(ip) && ip != realIP {
-			
 			
 			finalCountry := strings.ToUpper(input.Country)
 			if loc != "" {
@@ -224,14 +276,14 @@ func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
 					IP:      input.IP,
 					Port:    input.Port,
 					Country: finalCountry, 
-					Org:     cleanOrgName(input.OrgInput), // Trace tidak punya info Org/ISP
+					Org:     cleanOrgName(input.OrgInput), 
 					Source:  "CF Trace",
 				},
 			}
 		}
 	}
-
 	
+	// LAYER 3: AWS CheckIP (Plain IP only)
 	body, code = rawSocketRequest(AwsURL, input.IP, input.Port)
 	if code == 200 {
 		ip := strings.TrimSpace(string(body))
@@ -241,8 +293,8 @@ func checkProxyManualSocket(input ProxyInput, realIP string) CheckResult {
 				Data: &ValidProxy{
 					IP:      input.IP,
 					Port:    input.Port,
-					Country: strings.ToUpper(input.Country), // Pakai Input
-					Org:     cleanOrgName(input.OrgInput),   // Pakai Input
+					Country: strings.ToUpper(input.Country), // Fallback Input
+					Org:     cleanOrgName(input.OrgInput),   // Fallback Input
 					Source:  "AWS",
 				},
 			}
@@ -371,7 +423,6 @@ func getPublicIPDirect() string {
 	return ""
 }
 
-// UPDATE: Mengembalikan IP dan Loc (Country)
 func parseTraceDetails(text string) (string, string) {
 	var ip, loc string
 	scanner := bufio.NewScanner(strings.NewReader(text))
