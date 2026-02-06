@@ -36,7 +36,7 @@ var workerURLs = []string{
 const (
 	TraceURL     = "https://1.1.1.1/cdn-cgi/trace"
 	AwsURL       = "https://checkip.amazonaws.com"
-	FileInput    = "Data/IPPROXY23K.txt"
+	FileInput    = "Data/IPProxy45Kbaru.txt"
 	FileAlive    = "Data/alive.txt"
 	FilePriority = "Data/Country-ALIVE.txt"
 )
